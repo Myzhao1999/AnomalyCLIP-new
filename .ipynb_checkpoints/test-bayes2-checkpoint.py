@@ -1,4 +1,3 @@
-
 import os
 import random
 import argparse
@@ -23,7 +22,8 @@ from logger import get_logger
 from utils import get_transform
 # 假设 metrics.py 存在于同级目录
 from metrics import image_level_metrics, pixel_level_metrics
-
+from skimage import measure
+from sklearn.metrics import auc
 
 # =================================================================================
 # 0. Bayes-PFL 基准数据与映射 (Baseline Data)
@@ -133,6 +133,9 @@ def process_object_metrics(obj_name, obj_data, is_image_only, is_pixel_only):
         # 【新增】诊断用 image AUROC（不影响原表格）
         'img_auc_global': None,          # 仅 scores_img_lse
         'img_auc_patch_topk': None,      # 仅 pixel_topk_mean_lse（推理时已存 pr_sp_patch_topk_lse）
+        # 【新增】你两条建议对应的新评估指标（只新增记录，不影响原表格）
+        'img_auc_patch_logitpool': None, # 4.1: patch logit pooling
+        'img_auc_fus_zalpha': None,      # 4.2: logit + 标准化 + 自适应权重 fusion
     }
 
     # 构造临时 wrapper
@@ -150,7 +153,7 @@ def process_object_metrics(obj_name, obj_data, is_image_only, is_pixel_only):
         gt_masks = obj_data['imgs_masks']
         lse_maps = obj_data['anomaly_maps_lse']
         # PRO 是最慢的，这里是并行的关键收益点
-        return pro_auc_np(gt_masks, lse_maps, max_fpr=0.3, num_th=200)
+        return pro_auc_np(gt_masks, lse_maps, max_step=200, expect_fpr=0.3)
 
     def calc_px_ap():
         if is_image_only:
@@ -163,7 +166,7 @@ def process_object_metrics(obj_name, obj_data, is_image_only, is_pixel_only):
 
     def calc_img_metrics():
         if is_pixel_only:
-            return (None, None, None, None, None, None)
+            return (None, None, None, None, None, None, None, None)
 
         # 注意：这里我们不需要深拷贝巨大的 image/map 数据，只拷贝引用结构
         local_wrapper = {obj_name: {
@@ -196,7 +199,22 @@ def process_object_metrics(obj_name, obj_data, is_image_only, is_pixel_only):
         f1 = f1_max_np(y_true, y_score)
         ap = average_precision_score(y_true, y_score)
 
-        return (auc_fus, auc_heu, f1, ap, auc_global, auc_patch)
+        # ===================== 新增：你的两条新建议的评估指标（只计算 image-auroc） =====================
+        # 4.1 Patch logit pooling image score
+        if 'pr_sp_patch_logitpool_lse' in obj_data and obj_data['pr_sp_patch_logitpool_lse'] is not None and len(obj_data['pr_sp_patch_logitpool_lse']) > 0:
+            local_wrapper[obj_name]['pr_sp'] = obj_data['pr_sp_patch_logitpool_lse']
+            auc_patch_logitpool = image_level_metrics(local_wrapper, obj_name, "image-auroc")
+        else:
+            auc_patch_logitpool = None
+
+        # 4.2 Logit + 标准化 + 自适应权重 fusion score
+        if 'pr_sp_fusion_zalpha_lse' in obj_data and obj_data['pr_sp_fusion_zalpha_lse'] is not None and len(obj_data['pr_sp_fusion_zalpha_lse']) > 0:
+            local_wrapper[obj_name]['pr_sp'] = obj_data['pr_sp_fusion_zalpha_lse']
+            auc_fus_zalpha = image_level_metrics(local_wrapper, obj_name, "image-auroc")
+        else:
+            auc_fus_zalpha = None
+
+        return (auc_fus, auc_heu, f1, ap, auc_global, auc_patch, auc_patch_logitpool, auc_fus_zalpha)
 
     # 使用线程池并行执行这 4 个任务
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as thread_executor:
@@ -218,6 +236,9 @@ def process_object_metrics(obj_name, obj_data, is_image_only, is_pixel_only):
         # 【新增】诊断指标
         res_stats['img_auc_global'] = img_res[4]
         res_stats['img_auc_patch_topk'] = img_res[5]
+        # 【新增】新指标
+        res_stats['img_auc_patch_logitpool'] = img_res[6]
+        res_stats['img_auc_fus_zalpha'] = img_res[7]
 
     # --- 3. 生成 Row (保持不变：不改原表格列) ---
     row = [
@@ -374,6 +395,20 @@ def setup_seed(seed):
 # 3. 主测试逻辑
 # =================================================================================
 
+# ===================== 新增：4.2 用到的标准化/自适应权重函数（不影响原有指标）=====================
+def _zscore_np(x, eps=1e-6):
+    x = np.asarray(x, dtype=np.float32)
+    if x.size == 0:
+        return x
+    return (x - x.mean()) / (x.std() + eps)
+
+
+def _sigmoid_np(x):
+    x = np.asarray(x, dtype=np.float32)
+    x = np.clip(x, -60.0, 60.0)  # 避免 exp overflow
+    return 1.0 / (1.0 + np.exp(-x))
+
+
 def test(args):
     os.makedirs(args.save_path, exist_ok=True)
     logger = get_logger(args.save_path)
@@ -464,14 +499,23 @@ def test(args):
     )
     obj_list = test_data.obj_list
 
-    # 【新增】results 中增加 pr_sp_patch_topk_lse，用于 image-auroc 诊断（不影响原逻辑）
+    # ===================== 新增：仅用于新评估指标的超参（默认不影响原行为） =====================
+    patch_pool_tau = float(getattr(args, "patch_pool_tau", 0.5))       # 4.1 patch pooling 温度
+    fusion_alpha_thr = float(getattr(args, "fusion_alpha_thr", 1.0))   # 4.2 自适应权重阈值（zscore 空间）
+
+    logger.info(f"[NewImageMetrics] patch_pool_tau={patch_pool_tau} | fusion_alpha_thr(z)={fusion_alpha_thr}")
+
+    # 【新增】results 中增加新字段（只增加，不影响原逻辑）
     results = {
         obj: {
             k: [] for k in [
                 'gt_sp',
                 'pr_sp_img_lse',
                 'pr_sp_fusion_lse',
-                'pr_sp_patch_topk_lse',   # <<< 新增：patch-only image score
+                'pr_sp_patch_topk_lse',      # 原有：patch topk prob mean
+                'pr_sp_img_margin_lse',      # 新增：global logit margin (sa - sn)
+                'pr_sp_patch_logitpool_lse', # 新增：4.1 patch logit pooling image score
+                'pr_sp_fusion_zalpha_lse',   # 新增：4.2 zscore+alpha fusion（推理后计算）
                 'imgs_masks',
                 'anomaly_maps',
                 'anomaly_maps_lse',
@@ -508,10 +552,16 @@ def test(args):
             sa_lse = torch.logsumexp(logits_abn, dim=-1) - math.log(logits_abn.shape[-1])
             scores_img_lse = torch.stack([sn_lse, sa_lse], dim=1).softmax(dim=-1)[:, 1]
 
+            # ===================== 新增：global logit margin，用于 4.2 =====================
+            img_margin_lse = (sa_lse - sn_lse)  # [B]
+
             batch_size = image.shape[0]
             ph = int(np.sqrt(patch_features[0].shape[1] - 1))
             sum_maps_lse_small = 0
             layer_topk_scores_lse = []
+
+            # ===================== 新增：累积 patch logit，用于 4.1 的 patch pooling =====================
+            patch_diff_sum = None  # [B, Npatch]
 
             for pf in patch_features:
                 pf = F.normalize(pf[:, 1:, :], dim=-1)
@@ -525,6 +575,10 @@ def test(args):
                 layer_topk_scores_lse.append(tk_val_lse.mean(dim=-1))
 
                 sum_maps_lse_small += a_maps_lse.view(batch_size, ph, ph)
+
+                # 新增：patch logit (a - n)
+                patch_diff = (p_score_a - p_score_n)  # [B, Npatch]
+                patch_diff_sum = patch_diff if patch_diff_sum is None else (patch_diff_sum + patch_diff)
 
             sum_maps_lse_small /= num_layers
             batch_anomaly_maps_lse = F.interpolate(
@@ -542,14 +596,40 @@ def test(args):
             # 原有 fusion（保持不变）
             fusion_scores_lse = scores_img_lse + pixel_topk_mean_lse
 
+            # ===================== 新增 4.1：patch logit pooling image score =====================
+            patch_diff_mean = patch_diff_sum / num_layers  # [B, Npatch]
+            Np = patch_diff_mean.shape[1]
+            img_patch_logitpool = (torch.logsumexp(patch_diff_mean / patch_pool_tau, dim=1) - math.log(Np)) * patch_pool_tau  # [B]
+
             for b in range(batch_size):
                 c = batch_cls[b]
                 results[c]['pr_sp_img_lse'].append(scores_img_lse[b].item())
-                results[c]['pr_sp_patch_topk_lse'].append(pixel_topk_mean_lse[b].item())  # <<< 新增
+                results[c]['pr_sp_patch_topk_lse'].append(pixel_topk_mean_lse[b].item())  # <<< 原有诊断
                 results[c]['pr_sp_fusion_lse'].append(fusion_scores_lse[b].item())
                 results[c]['gt_sp'].append(batch_anom[b].item())
                 results[c]['anomaly_maps_lse'].append(smoothed_maps_lse_batch[b])
                 results[c]['imgs_masks'].append(gt_mask[b].squeeze().cpu().numpy())
+
+                # 新增存储（只新增，不影响原有指标）
+                results[c]['pr_sp_img_margin_lse'].append(img_margin_lse[b].item())
+                results[c]['pr_sp_patch_logitpool_lse'].append(img_patch_logitpool[b].item())
+
+    # ===================== 新增 4.2：基于 logit + 标准化 + 自适应权重 的融合分数（按 object 计算） =====================
+    for obj in obj_list:
+        g = np.asarray(results[obj]['pr_sp_img_margin_lse'], dtype=np.float32)          # global logit margin
+        p = np.asarray(results[obj]['pr_sp_patch_logitpool_lse'], dtype=np.float32)    # patch logit pooling score
+
+        if g.size == 0 or p.size == 0:
+            results[obj]['pr_sp_fusion_zalpha_lse'] = []
+            continue
+
+        g_z = _zscore_np(g)
+        p_z = _zscore_np(p)
+
+        alpha = _sigmoid_np(np.abs(g_z) - fusion_alpha_thr)  # [0,1]
+        fusion_zalpha = p_z + alpha * g_z
+
+        results[obj]['pr_sp_fusion_zalpha_lse'] = fusion_zalpha.tolist()
 
     # =================================================================================
     # Pixel Ratio Statistics (Dataset Level)
@@ -635,6 +715,13 @@ def test(args):
         'img_auc_heu': [],
     }
 
+    # 【新增】你的两条建议对应的新评估指标统计（不影响原表格）
+    img_auc_new_rows = []
+    img_auc_new_summary = {
+        'img_auc_patch_logitpool': [],
+        'img_auc_fus_zalpha': [],
+    }
+
     logger.info("Starting Parallel Metric Calculation...")
     start_time = time.time()
 
@@ -664,7 +751,7 @@ def test(args):
             if res_stats['ap_fus'] is not None:
                 summary['ap_fus'].append(res_stats['ap_fus'])
 
-            # 【新增】收集 image AUROC 策略诊断数据
+            # 【新增】收集 image AUROC 策略诊断数据（原有）
             if (not is_pixel_only) and (res_stats.get('img_auc_fus', None) is not None):
                 img_auc_strategy_rows.append([
                     obj_name,
@@ -682,6 +769,18 @@ def test(args):
                     img_auc_strategy_summary['img_auc_fus'].append(res_stats['img_auc_fus'])
                 if res_stats['img_auc_heu'] is not None:
                     img_auc_strategy_summary['img_auc_heu'].append(res_stats['img_auc_heu'])
+
+                # 【新增】收集你两条建议的指标
+                img_auc_new_rows.append([
+                    obj_name,
+                    f"{res_stats['img_auc_patch_logitpool'] * 100:.1f}" if res_stats['img_auc_patch_logitpool'] is not None else "-",
+                    f"{res_stats['img_auc_fus_zalpha'] * 100:.1f}" if res_stats['img_auc_fus_zalpha'] is not None else "-",
+                ])
+
+                if res_stats['img_auc_patch_logitpool'] is not None:
+                    img_auc_new_summary['img_auc_patch_logitpool'].append(res_stats['img_auc_patch_logitpool'])
+                if res_stats['img_auc_fus_zalpha'] is not None:
+                    img_auc_new_summary['img_auc_fus_zalpha'].append(res_stats['img_auc_fus_zalpha'])
 
     end_time = time.time()
     logger.info(f"Metrics calculation finished in {end_time - start_time:.2f} seconds.")
@@ -744,26 +843,61 @@ def test(args):
 
         img_strategy_table_str = tabulate(img_auc_strategy_rows, headers=img_strategy_headers, tablefmt="pipe")
 
+    # 【新增】你的两条建议对应的新评估指标表（仅日志输出，不影响原表格）
+    img_new_table_str = None
+    if not is_pixel_only:
+        img_auc_new_rows.sort(key=lambda x: x[0])
+
+        img_new_headers = [
+            "Object",
+            "Img-AUROC(PatchLogitPool)",
+            "Img-AUROC(Fusion-ZAlpha)",
+        ]
+
+        if img_auc_new_summary['img_auc_patch_logitpool'] or img_auc_new_summary['img_auc_fus_zalpha']:
+            mean_new_row = ["Mean (Diff vs Bayes img_auc)"]
+            mean_new_row.append(format_score_with_diff(np.mean(img_auc_new_summary['img_auc_patch_logitpool']), baseline_stats, "img_auc")
+                                if img_auc_new_summary['img_auc_patch_logitpool'] else "-")
+            mean_new_row.append(format_score_with_diff(np.mean(img_auc_new_summary['img_auc_fus_zalpha']), baseline_stats, "img_auc")
+                                if img_auc_new_summary['img_auc_fus_zalpha'] else "-")
+            img_auc_new_rows.append(mean_new_row)
+
+        img_new_table_str = tabulate(img_auc_new_rows, headers=img_new_headers, tablefmt="pipe")
+
     final_log_path = os.path.join(args.save_path, args.result_log if args.result_log.endswith('.log') else 'results.log')
     with open(final_log_path, "a") as f:
         f.write("\n" + "=" * 30 + " PIXEL RATIO STATISTICS " + "=" * 30 + "\n")
         f.write(ratio_table_str + "\n")
         f.write("=" * 80 + "\n")
 
-        # 【新增】把多策略 Image AUROC 也写入同一个 log 文件（只添加，不改原逻辑）
+        # 【原有】把多策略 Image AUROC 也写入同一个 log 文件（只添加，不改原逻辑）
         if img_strategy_table_str is not None:
             f.write("\n" + "=" * 26 + " IMAGE AUROC STRATEGY DIAGNOSTIC " + "=" * 26 + "\n")
             f.write(f"Dataset: {args.dataset} (Mapped: {bayes_key})\n")
             f.write(img_strategy_table_str + "\n")
             f.write("=" * 80 + "\n")
 
+        # 【新增】写入 PatchLogitPool / Fusion-ZAlpha（只追加）
+        if img_new_table_str is not None:
+            f.write("\n" + "=" * 18 + " IMAGE AUROC NEW METRICS (PATCH-LOGITPOOL / ZALPHA) " + "=" * 18 + "\n")
+            f.write(f"Dataset: {args.dataset} (Mapped: {bayes_key})\n")
+            f.write(f"patch_pool_tau={patch_pool_tau} | fusion_alpha_thr(z)={fusion_alpha_thr}\n")
+            f.write(img_new_table_str + "\n")
+            f.write("=" * 80 + "\n")
+
     logger.info(f"\n{results_table}")
 
-    # 【新增】输出到 logger（从而进入你的日志系统）
+    # 【原有】输出到 logger（从而进入你的日志系统）
     if img_strategy_table_str is not None:
         logger.info("\n" + "=" * 26 + " IMAGE AUROC STRATEGY DIAGNOSTIC " + "=" * 26)
         logger.info(f"Dataset: {args.dataset} (Mapped: {bayes_key})")
         logger.info("\n" + img_strategy_table_str)
+
+    # 【新增】输出到 logger（只追加）
+    if img_new_table_str is not None:
+        logger.info("\n" + "=" * 18 + " IMAGE AUROC NEW METRICS (PATCH-LOGITPOOL / ZALPHA) " + "=" * 18)
+        logger.info(f"Dataset: {args.dataset} (Mapped: {bayes_key}) | patch_pool_tau={patch_pool_tau} | fusion_alpha_thr(z)={fusion_alpha_thr}")
+        logger.info("\n" + img_new_table_str)
 
 
 if __name__ == '__main__':
@@ -791,7 +925,13 @@ if __name__ == '__main__':
     parser.add_argument("--topk", type=int, default=10)
     parser.add_argument("--vmf_usage_reg_a", type=float, default=0.0)
     parser.add_argument("--prompt_num", type=int, default=10)
+
+    # ===================== 新增：仅用于新评估指标的参数（有默认值，不影响旧用法） =====================
+    parser.add_argument("--patch_pool_tau", type=float, default=0.5,
+                        help="tau for patch-logit soft pooling (smaller -> closer to max pooling)")
+    parser.add_argument("--fusion_alpha_thr", type=float, default=1.0,
+                        help="threshold in z-score space for adaptive fusion alpha (larger -> more conservative)")
+
     args = parser.parse_args()
     setup_seed(args.seed)
     test(args)
-

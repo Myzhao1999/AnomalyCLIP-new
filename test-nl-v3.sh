@@ -4,8 +4,8 @@ set -euo pipefail
 # ================= 配置区域 =================
 
 # 1. 硬件与 Python 脚本配置
-DEVICE_ID=1
-PYTHON_SCRIPT="test-fast.py"
+DEVICE_ID=7
+PYTHON_SCRIPT="test-bayes2.py"
 
 # 2. 模型核心参数
 DEPTH=9
@@ -15,15 +15,15 @@ NUM_PROTOTYPES=64
 FEATURES_LIST=(9 12 15 18 21 24)
 IMAGE_SIZE=518
 SIGMA=8
-topk=10
+topk=7
 prompt_num=12
 # 3. 路径配置  (9 12 15 18 21 24)
 CKPT_ROOT="save_ckpt"
 RESULTS_ROOT="save_results"
-BASE_DIR="64_preby_mvtec-clinic595-3-1diceabn-12prompt-newloss-v2new-withlabel0patch"
+BASE_DIR="64_preby_mvtec-clinic-12prompt-newloss-v3"
 
 # 4. 需要测试的 Epoch 列表
-EPOCHS=(52 46 48 53 54 55 56)
+EPOCHS=(50 52 54 56 48 40 44)
 
 # 5. 数据集列表   'SDD:data/SDD'      'tn3k:data/tn3k'
 DATASETS_CONFIG=(

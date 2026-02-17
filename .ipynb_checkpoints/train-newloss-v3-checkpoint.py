@@ -329,21 +329,22 @@ def train(args):
     model.to(device)
     model.visual.DAPM_replace(DPAM_layer=None)
 
-    # 3) 数据与优化器
-    #train_data = Dataset(root=args.train_data_path, transform=preprocess,target_transform=target_transform,dataset_name=args.dataset)
-    train_data = Dataset(root=args.train_data_path, transform=preprocess, target_transform=target_transform, dataset_name = args.dataset)
 
-    
-    train_aug_rate = 0.2 if args.dataset == "mvtec" and args.aug_rate < 0 else max(args.aug_rate, 0.0)
+    # 3) 数据与优化器
     train_data = Dataset(
         root=args.train_data_path,
         transform=preprocess,
         target_transform=target_transform,
-        dataset_name=args.dataset,
-        training=True,
-        aug_rate=train_aug_rate,
+        dataset_name=args.dataset
     )
-    train_dataloader = torch.utils.data.DataLoader(train_data,batch_size=args.batch_size,shuffle=True,num_workers=args.num_workers,pin_memory=True if device == "cuda" else False,drop_last=True)
+    train_dataloader = torch.utils.data.DataLoader(
+        train_data,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True if device == "cuda" else False,
+        drop_last=True
+    )
     model_components = (prompt_learner, identity_proj, deviation_proj, swav_list, swav_abn_list)
     optimizer = get_optimizer(args, model_components)
 
@@ -357,7 +358,7 @@ def train(args):
     mil_img_weight = float(getattr(args, "mil_img_loss_weight", 0.1))
     bg_topk_ratio = float(getattr(args, "bg_topk_ratio", 0.20))        # 正常图 top 10% patches
     #mil_img_weight = float(getattr(args, "mil_img_weight", 0.1))        # MIL 权重
-    mil_topk_ratio = float(getattr(args, "mil_topk_ratio", 0.05))       # top 5% patches
+    mil_topk_ratio = float(getattr(args, "mil_topk_ratio", 0.006))       # top 5% patches
     proto_grad_scale = float(getattr(args, "proto_grad_scale", 0.1))    # 原型梯度缩放
 
     logger.info(
@@ -870,14 +871,8 @@ if __name__ == '__main__':
     # 3) MIL image loss（把分类与定位绑定）
     parser.add_argument("--mil_img_loss_weight", type=float, default=0.1,
                         help="weight of MIL image loss (0 disables)")
-    parser.add_argument("--mil_topk_ratio", type=float, default=0.05,
+    parser.add_argument("--mil_topk_ratio", type=float, default=0.006,
                         help="top-k ratio for MIL pooling (patch-level)")
-    parser.add_argument(
-        "--aug_rate",
-        type=float,
-        default=-1.0,
-        help="mosaic augmentation probability for training; -1 means dataset default (mvtec=0.2, others=0.0)",
-    )
 
     args = parser.parse_args()
     setup_seed(args.seed)

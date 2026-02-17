@@ -19,14 +19,14 @@ prompt_num=12
 for i in "${!depth[@]}";do
     for j in "${!n_ctx[@]}";do
     ## train on the VisA dataset
-        base_dir=${num_prototypes}_preby_${pretrained_dataset}${focal_1}${focal_2}-${focal_gamma}-${dice_abn}diceabn-${prompt_num}prompt-newloss-v2new-withlabel0patch-augment
+        base_dir=${num_prototypes}_preby_${pretrained_dataset}-${prompt_num}prompt-newloss-v3
         save_dir=./save_ckpt/${base_dir}
-        CUDA_VISIBLE_DEVICES=${device} python train-newloss-v2.py --dataset ${pretrained_dataset} --train_data_path ${pretrained_data_path} \
+        CUDA_VISIBLE_DEVICES=${device} python train-newloss-v3.py --dataset ${pretrained_dataset} --train_data_path ${pretrained_data_path} \
         --save_path ${save_dir} \
         --features_list "${FEATURES_LIST[@]}" \
         --batch_size 48 --num_prototypes ${num_prototypes} \
         --epoch 80 --depth ${depth[i]} --n_ctx ${n_ctx[j]} --t_n_ctx ${t_n_ctx[0]} \
-        --dice_abn ${dice_abn} --focal_1 ${focal_1} --focal_2 ${focal_2} --focal_gamma ${focal_gamma} --prompt_num ${prompt_num} --aug_rate 0.2
+        --dice_abn ${dice_abn} --focal_1 ${focal_1} --focal_2 ${focal_2} --focal_gamma ${focal_gamma} --prompt_num ${prompt_num}
     wait
     done
 done
